@@ -15,7 +15,8 @@ sh -c "for i in 1 2 3; do echo tick $i; done"
 sleep 600
 
 # --- trouble: tries to eat all memory (should be OOM-killed, not host death) ---
-python3 -c "b=bytearray(); \nwhile True: b.extend(bytearray(10*1024*1024))"
+# 单行合法 Python:iter(int,1) 是无限迭代器,每轮分配 10MB 并保留,内存持续增长直到 OOM。
+python3 -c "x=[bytearray(10*1024*1024) for _ in iter(int,1)]"
 
 # --- trouble: forks a swarm of child processes (all must die on kill) ---
 sh -c "for i in $(seq 1 20); do sleep 600 & done; wait"
