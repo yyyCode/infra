@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-Task executor — 阶段 5(日志与产物 + 按 ID 查询)。
+Task executor — 阶段 6(资源清理)。
 
-在阶段 4(失败分类与重试)之上,新增:
-  - 独立日志自解释:每个任务的 logs/<id>.log 顶部写入头部(任务 ID、命令、
-    第几次尝试、时间),stdout/stderr 合并落文件
-  - 状态查询:
-      * --status        打印所有任务的状态表(id/state/exit_code/attempts/log_path)
-      * --status ID     打印单个任务详情
-      * --log ID        打印单个任务的日志文件内容
-    查询是只读操作,不触发执行、不需要 docker
+在阶段 5(日志与产物 + 按 ID 查询)之上,新增机制化清理(而非最后手动清一遍):
+  - 容器不堆积:每个任务容器在结果判定后立即 docker rm(用 try/finally 保证
+    异常路径也删)。不用 --rm 是因为超时后需要先 docker inspect 读 OOMKilled,
+    --rm 会抢先删掉容器导致读不到状态。
+  - 悬空镜像不增长:批次结束后 docker image prune -f 清理 dangling 镜像。
+  - 启动兜底:cleanup_stale_containers 在启动时清掉上次异常退出的残留容器。
+  - --no-prune 可关闭批次结束时的镜像清理。
 
-仍【刻意保留】的缺陷(留给后续阶段):
-  - 无机制化资源清理(退出容器/悬空镜像)  (阶段 6)
+生命周期:谁创建谁负责删 —— run_once 里起容器,finally 里删容器;
+main 批次结束统一 prune 镜像;启动清理兜底掉进程崩溃时来不及删的残留。
 
 Usage:
     python3 runner.py [tasks_file] [--concurrency N] [--memory M] [--cpus C]
-                      [--timeout S] [--max-retries N]
+                      [--timeout S] [--max-retries N] [--no-prune]
     python3 runner.py --resume        # 只恢复未完成任务,不导入新清单
     python3 runner.py --status [ID]   # 查所有/单个任务状态
     python3 runner.py --log ID        # 查单个任务日志
@@ -197,37 +196,45 @@ def run_once(task_id, command, limits, log_path, attempt=1):
     )
 
     timed_out = False
-    # 用 Popen 而非 run:超时后我们要主动杀容器,而不是只等客户端。
-    # --memory 限内存,--memory-swap 与之相等禁止用 swap 绕过,--cpus 限 CPU。
-    with open(log_path, "w", encoding="utf-8") as log:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        log.write(f"# task {task_id} | attempt {attempt} | {ts}\n")
-        log.write(f"# command: {command}\n")
-        log.write("# ---- output ----\n")
-        log.flush()   # 确保头部在容器输出之前落盘
-        proc = subprocess.Popen(
-            [
-                "docker", "run", "--name", name,
-                "--memory", limits["memory"],
-                "--memory-swap", limits["memory"],
-                "--cpus", limits["cpus"],
-                IMAGE, "/bin/sh", "-c", command,
-            ],
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        try:
-            returncode = proc.wait(timeout=limits["timeout"])
-        except subprocess.TimeoutExpired:
-            # 超时后 `docker run` 客户端还连着,容器仍在后台跑。必须显式杀容器。
-            timed_out = True
-            kill_container(name)
-            proc.wait()
-            returncode = proc.returncode
+    try:
+        # 用 Popen 而非 run:超时后我们要主动杀容器,而不是只等客户端。
+        # --memory 限内存,--memory-swap 与之相等禁止用 swap 绕过,--cpus 限 CPU。
+        with open(log_path, "w", encoding="utf-8") as log:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            log.write(f"# task {task_id} | attempt {attempt} | {ts}\n")
+            log.write(f"# command: {command}\n")
+            log.write("# ---- output ----\n")
+            log.flush()   # 确保头部在容器输出之前落盘
+            proc = subprocess.Popen(
+                [
+                    "docker", "run", "--name", name,
+                    "--memory", limits["memory"],
+                    "--memory-swap", limits["memory"],
+                    "--cpus", limits["cpus"],
+                    IMAGE, "/bin/sh", "-c", command,
+                ],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            try:
+                returncode = proc.wait(timeout=limits["timeout"])
+            except subprocess.TimeoutExpired:
+                # 超时后 `docker run` 客户端还连着,容器仍在后台跑。必须显式杀容器。
+                timed_out = True
+                kill_container(name)
+                proc.wait()
+                returncode = proc.returncode
 
-    oom = (not timed_out) and returncode == 137 and was_oom_killed(name)
-    return returncode, timed_out, oom
+        # OOM 判定必须在删容器之前(要读 docker inspect State.OOMKilled)。
+        oom = (not timed_out) and returncode == 137 and was_oom_killed(name)
+        return returncode, timed_out, oom
+    finally:
+        # 谁创建谁负责删:无论成功/失败/超时/异常,都移除这个容器,不堆积。
+        subprocess.run(
+            ["docker", "rm", "-f", name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
 
 def run_task(conn, task_id, command, limits, log_dir=LOG_DIR):
@@ -321,7 +328,7 @@ def show_log(conn, task_id):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="容器任务执行器(阶段 5)")
+    p = argparse.ArgumentParser(description="容器任务执行器(阶段 6)")
     p.add_argument("tasks", nargs="?", default="tasks.txt", help="任务清单文件(默认 tasks.txt)")
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                    help=f"最大并发任务数(默认 {DEFAULT_CONCURRENCY})")
@@ -340,7 +347,20 @@ def parse_args():
                    help="查询任务状态:不带 ID 打印全部,带 ID 打印单个详情")
     p.add_argument("--log", type=int, default=None, metavar="ID",
                    help="打印指定任务的日志内容")
+    p.add_argument("--no-prune", action="store_true",
+                   help="批次结束后不清理悬空镜像")
     return p.parse_args()
+
+
+def prune_images():
+    """批次结束后清理悬空(dangling)镜像,避免无限增长。"""
+    r = subprocess.run(
+        ["docker", "image", "prune", "-f"],
+        capture_output=True, text=True,
+    )
+    out = (r.stdout or "").strip()
+    if out:
+        print(f"镜像清理:{out.splitlines()[-1]}")
 
 
 def cleanup_stale_containers():
@@ -400,6 +420,10 @@ def main():
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         for task_id, command in rows:
             pool.submit(run_task, conn, task_id, command, limits)
+
+    # 批次结束:清理悬空镜像(容器已在各任务的 finally 里删除)。
+    if not args.no_prune:
+        prune_images()
 
     print("\n==== summary ====")
     for row in conn.execute(
