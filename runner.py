@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-Task executor — 阶段 4(失败分类与重试)。
+Task executor — 阶段 5(日志与产物 + 按 ID 查询)。
 
-在阶段 3(状态持久化与崩溃恢复)之上,新增:
-  - 失败分类:区分「容器没起来」和「任务自己跑挂了」
-      * infra   : docker run 退出码 125(镜像拉不到/参数错等),容器根本没起
-      * oom     : 137 且 State.OOMKilled,内存超限被杀(确定性)
-      * timeout : 超时被强杀(确定性)
-      * task    : 容器起来了但命令跑出非零退出码
-  - 分策略重试(重试有上限 --max-retries,attempts 落库):
-      * infra → 指数退避重试(容器没起来往往是瞬时问题,值得等一下再试)
-      * task  → 短固定间隔重试(可能是偶发,重试或能过)
-      * oom / timeout → 确定性失败,不重试,直接落终态
-  - 重跑不碰已成功任务(沿用阶段 3 的幂等)
+在阶段 4(失败分类与重试)之上,新增:
+  - 独立日志自解释:每个任务的 logs/<id>.log 顶部写入头部(任务 ID、命令、
+    第几次尝试、时间),stdout/stderr 合并落文件
+  - 状态查询:
+      * --status        打印所有任务的状态表(id/state/exit_code/attempts/log_path)
+      * --status ID     打印单个任务详情
+      * --log ID        打印单个任务的日志文件内容
+    查询是只读操作,不触发执行、不需要 docker
 
 仍【刻意保留】的缺陷(留给后续阶段):
   - 无机制化资源清理(退出容器/悬空镜像)  (阶段 6)
@@ -21,6 +18,8 @@ Usage:
     python3 runner.py [tasks_file] [--concurrency N] [--memory M] [--cpus C]
                       [--timeout S] [--max-retries N]
     python3 runner.py --resume        # 只恢复未完成任务,不导入新清单
+    python3 runner.py --status [ID]   # 查所有/单个任务状态
+    python3 runner.py --log ID        # 查单个任务日志
 """
 
 import argparse
@@ -184,8 +183,12 @@ def classify(returncode, timed_out, oom):
     return "task", True
 
 
-def run_once(task_id, command, limits, log_path):
-    """执行一次容器任务,返回 (returncode, timed_out, oom)。不写库。"""
+def run_once(task_id, command, limits, log_path, attempt=1):
+    """执行一次容器任务,返回 (returncode, timed_out, oom)。不写库。
+
+    日志文件顶部写入自解释头部(任务 ID、命令、第几次尝试、时间),便于
+    单独打开某个日志文件就能知道它是哪个任务、哪次尝试的产物。
+    """
     name = f"runner-{task_id}"
     # 兜底:清掉可能残留的同名容器,避免重名冲突(重试时上一次的残留)。
     subprocess.run(
@@ -197,6 +200,11 @@ def run_once(task_id, command, limits, log_path):
     # 用 Popen 而非 run:超时后我们要主动杀容器,而不是只等客户端。
     # --memory 限内存,--memory-swap 与之相等禁止用 swap 绕过,--cpus 限 CPU。
     with open(log_path, "w", encoding="utf-8") as log:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        log.write(f"# task {task_id} | attempt {attempt} | {ts}\n")
+        log.write(f"# command: {command}\n")
+        log.write("# ---- output ----\n")
+        log.flush()   # 确保头部在容器输出之前落盘
         proc = subprocess.Popen(
             [
                 "docker", "run", "--name", name,
@@ -239,7 +247,7 @@ def run_task(conn, task_id, command, limits, log_dir=LOG_DIR):
             "UPDATE tasks SET state='running', attempts=attempts+1, started_at=?, log_path=? WHERE id=?",
             (time.time(), log_path, task_id),
         )
-        returncode, timed_out, oom = run_once(task_id, command, limits, log_path)
+        returncode, timed_out, oom = run_once(task_id, command, limits, log_path, attempt)
         category, retryable = classify(returncode, timed_out, oom)
 
         if category == "ok":
@@ -266,8 +274,54 @@ def run_task(conn, task_id, command, limits, log_dir=LOG_DIR):
     return returncode
 
 
+def show_status(conn, task_id=None):
+    """打印任务状态。task_id 为 None 打印全部表格,否则打印单个任务详情。"""
+    if task_id is None:
+        rows = conn.execute(
+            "SELECT id, state, exit_code, attempts, log_path FROM tasks ORDER BY id"
+        ).fetchall()
+        if not rows:
+            print("(无任务)")
+            return
+        print(f"{'ID':>3}  {'STATE':<10} {'EXIT':>4} {'TRY':>3}  LOG")
+        for r in rows:
+            print(f"{r[0]:>3}  {r[1]:<10} {str(r[2] if r[2] is not None else '-'):>4} "
+                  f"{r[3]:>3}  {r[4] or '-'}")
+        return
+
+    row = conn.execute(
+        "SELECT id, command, state, exit_code, attempts, log_path, started_at, ended_at "
+        "FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if not row:
+        print(f"任务 {task_id} 不存在")
+        return
+    print(f"任务 ID   : {row[0]}")
+    print(f"命令      : {row[1]}")
+    print(f"状态      : {row[2]}")
+    print(f"退出码    : {row[3] if row[3] is not None else '-'}")
+    print(f"尝试次数  : {row[4]}")
+    print(f"日志路径  : {row[5] or '-'}")
+
+
+def show_log(conn, task_id):
+    """打印单个任务的日志文件内容。"""
+    row = conn.execute(
+        "SELECT log_path FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if not row:
+        print(f"任务 {task_id} 不存在")
+        return
+    log_path = row[0]
+    if not log_path or not os.path.exists(log_path):
+        print(f"任务 {task_id} 暂无日志(log_path={log_path or '-'})")
+        return
+    with open(log_path, encoding="utf-8") as f:
+        sys.stdout.write(f.read())
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="容器任务执行器(阶段 4)")
+    p = argparse.ArgumentParser(description="容器任务执行器(阶段 5)")
     p.add_argument("tasks", nargs="?", default="tasks.txt", help="任务清单文件(默认 tasks.txt)")
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                    help=f"最大并发任务数(默认 {DEFAULT_CONCURRENCY})")
@@ -281,6 +335,11 @@ def parse_args():
                    help=f"可重试失败的最大重试次数(默认 {DEFAULT_MAX_RETRIES})")
     p.add_argument("--resume", action="store_true",
                    help="只恢复未完成任务,不导入新清单")
+    p.add_argument("--status", nargs="?", type=int, const=-1, default=None,
+                   metavar="ID",
+                   help="查询任务状态:不带 ID 打印全部,带 ID 打印单个详情")
+    p.add_argument("--log", type=int, default=None, metavar="ID",
+                   help="打印指定任务的日志内容")
     return p.parse_args()
 
 
@@ -301,6 +360,16 @@ def main():
     args = parse_args()
     os.makedirs(LOG_DIR, exist_ok=True)
     conn = init_db()
+
+    # 查询模式:只读,不执行任务、不碰 docker,查完即退出。
+    if args.log is not None:
+        show_log(conn, args.log)
+        conn.close()
+        return
+    if args.status is not None:
+        show_status(conn, None if args.status == -1 else args.status)
+        conn.close()
+        return
 
     # 启动清理:去掉上一轮残留容器(重名会导致 docker run 失败)
     cleanup_stale_containers()

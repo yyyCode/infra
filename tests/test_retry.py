@@ -62,7 +62,7 @@ class RetryTestBase(unittest.TestCase):
         runner.run_once = self._orig_run_once
         self.conn.close()
 
-    def _fake_run_once(self, task_id, command, limits, log_path):
+    def _fake_run_once(self, task_id, command, limits, log_path, attempt=1):
         """按命令关键字返回不同的 (returncode, timed_out, oom)。"""
         n = self.calls.get(task_id, 0) + 1
         self.calls[task_id] = n
