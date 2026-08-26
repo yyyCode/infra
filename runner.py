@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """
-Task executor — 阶段 3(状态持久化与崩溃恢复)。
+Task executor — 阶段 4(失败分类与重试)。
 
-在阶段 2(超时强杀)之上,新增:
-  - 崩溃恢复:runner 被 kill -9 后重启,上次残留在 running 的任务(崩溃时在飞)
-    会被重新入队执行;导入清单时按命令去重,不重复导入
-  - 已成功绝不重跑:只执行 state='queued' 的任务,succeeded/failed/timed_out
-    都不会再动(靠 DB 里的终态判断,天然幂等)
-  - 启动清理:清掉上一轮遗留的 runner-* 容器,避免重名冲突
-
-关键认知:状态即时落库(queued->running->终态),所以任何时刻被 kill -9,
-DB 都反映真实进度;重启时"running"就代表"上次没跑完",据此恢复。
+在阶段 3(状态持久化与崩溃恢复)之上,新增:
+  - 失败分类:区分「容器没起来」和「任务自己跑挂了」
+      * infra   : docker run 退出码 125(镜像拉不到/参数错等),容器根本没起
+      * oom     : 137 且 State.OOMKilled,内存超限被杀(确定性)
+      * timeout : 超时被强杀(确定性)
+      * task    : 容器起来了但命令跑出非零退出码
+  - 分策略重试(重试有上限 --max-retries,attempts 落库):
+      * infra → 指数退避重试(容器没起来往往是瞬时问题,值得等一下再试)
+      * task  → 短固定间隔重试(可能是偶发,重试或能过)
+      * oom / timeout → 确定性失败,不重试,直接落终态
+  - 重跑不碰已成功任务(沿用阶段 3 的幂等)
 
 仍【刻意保留】的缺陷(留给后续阶段):
-  - 无失败分类与重试                    (阶段 4)
   - 无机制化资源清理(退出容器/悬空镜像)  (阶段 6)
 
 Usage:
-    python3 runner.py [tasks_file] [--concurrency N] [--memory M] [--cpus C] [--timeout S]
+    python3 runner.py [tasks_file] [--concurrency N] [--memory M] [--cpus C]
+                      [--timeout S] [--max-retries N]
     python3 runner.py --resume        # 只恢复未完成任务,不导入新清单
 """
 
@@ -40,6 +42,11 @@ DEFAULT_MEMORY = "256m"
 DEFAULT_CPUS = "1.0"
 DEFAULT_TIMEOUT = 30          # 单个任务超时秒数
 STOP_GRACE = 5               # docker stop 的宽限秒数,超过则 kill 兜底
+DEFAULT_MAX_RETRIES = 2       # 可重试失败的最大重试次数(不含首次执行)
+
+# docker CLI 自身错误(容器没起来)的退出码。125=docker run 命令本身失败;
+# 126/127=入口点不可执行/找不到,通常也是环境问题而非任务逻辑失败。
+DOCKER_INFRA_EXIT_CODES = {125, 126, 127}
 
 # 保护 SQLite 写入:默认连接非线程安全,并发下用一把锁串行化写。
 _db_lock = threading.Lock()
@@ -156,27 +163,34 @@ def kill_container(name):
     )
 
 
-def run_task(conn, task_id, command, limits, log_dir=LOG_DIR):
-    """在独立容器里执行一个任务(带资源限额 + 超时强杀)。
+def classify(returncode, timed_out, oom):
+    """把一次执行结果分类,返回 (category, is_retryable)。
 
-    limits: dict(memory, cpus, timeout)。可被线程池并发调用,写库走 db_write 串行化。
+    category ∈ ok | infra | oom | timeout | task
+      - ok      : 成功
+      - infra   : 容器没起来(docker 退出码 125/126/127),可重试(退避)
+      - oom     : 内存超限被杀,确定性失败,不重试
+      - timeout : 超时被强杀,确定性失败,不重试
+      - task    : 容器起来了但命令非零退出,可重试(短间隔)
     """
-    name = f"runner-{task_id}"
-    log_path = os.path.join(log_dir, f"{task_id}.log")
-    print(f"[task {task_id}] START: {command}  (log: {log_path})")
+    if returncode == 0:
+        return "ok", False
+    if timed_out:
+        return "timeout", False
+    if oom:
+        return "oom", False
+    if returncode in DOCKER_INFRA_EXIT_CODES:
+        return "infra", True
+    return "task", True
 
-    # 兜底:清掉可能残留的同名容器,避免重名冲突。
-    # (这里只为让容器命名可重跑;机制化清理留待阶段 6)
+
+def run_once(task_id, command, limits, log_path):
+    """执行一次容器任务,返回 (returncode, timed_out, oom)。不写库。"""
+    name = f"runner-{task_id}"
+    # 兜底:清掉可能残留的同名容器,避免重名冲突(重试时上一次的残留)。
     subprocess.run(
         ["docker", "rm", "-f", name],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    db_write(
-        conn,
-        "UPDATE tasks SET state='running', attempts=attempts+1, started_at=?, log_path=? WHERE id=?",
-        (time.time(), log_path, task_id),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
     timed_out = False
@@ -198,33 +212,62 @@ def run_task(conn, task_id, command, limits, log_dir=LOG_DIR):
         try:
             returncode = proc.wait(timeout=limits["timeout"])
         except subprocess.TimeoutExpired:
-            # 关键:超时后 `docker run` 客户端还连着,容器仍在后台跑。
-            # 必须显式杀容器,才能连同派生的子进程一起干掉。
+            # 超时后 `docker run` 客户端还连着,容器仍在后台跑。必须显式杀容器。
             timed_out = True
             kill_container(name)
-            proc.wait()          # 容器被杀后,客户端随之退出,回收它
+            proc.wait()
             returncode = proc.returncode
 
-    if timed_out:
-        state = "timed_out"
-        oom = False
-    else:
-        # 退出码 137 通常是被 SIGKILL(OOM 常见),再查 OOMKilled 确认。
-        oom = returncode == 137 and was_oom_killed(name)
-        state = "succeeded" if returncode == 0 else "failed"
+    oom = (not timed_out) and returncode == 137 and was_oom_killed(name)
+    return returncode, timed_out, oom
+
+
+def run_task(conn, task_id, command, limits, log_dir=LOG_DIR):
+    """执行一个任务,按失败类别分策略重试,最终状态与退出码落库。
+
+    limits: dict(memory, cpus, timeout, max_retries)。线程池并发调用,写库串行化。
+    """
+    log_path = os.path.join(log_dir, f"{task_id}.log")
+    max_retries = limits["max_retries"]
+    print(f"[task {task_id}] START: {command}  (log: {log_path})")
+
+    attempt = 0
+    while True:
+        attempt += 1
+        db_write(
+            conn,
+            "UPDATE tasks SET state='running', attempts=attempts+1, started_at=?, log_path=? WHERE id=?",
+            (time.time(), log_path, task_id),
+        )
+        returncode, timed_out, oom = run_once(task_id, command, limits, log_path)
+        category, retryable = classify(returncode, timed_out, oom)
+
+        if category == "ok":
+            state = "succeeded"
+            break
+        if retryable and attempt <= max_retries:
+            # infra 用指数退避(2,4,8…),task 用短固定间隔。
+            delay = 2 ** attempt if category == "infra" else 1
+            print(f"[task {task_id}] {category} 失败(exit={returncode}),"
+                  f"第 {attempt}/{max_retries} 次重试,{delay}s 后重试")
+            time.sleep(delay)
+            continue
+        # 不可重试,或重试已用尽 -> 落终态
+        state = "timed_out" if category == "timeout" else "failed"
+        break
 
     db_write(
         conn,
         "UPDATE tasks SET state=?, exit_code=?, ended_at=? WHERE id=?",
         (state, returncode, time.time(), task_id),
     )
-    tag = " [OOM-killed]" if oom else (" [timeout-killed]" if timed_out else "")
-    print(f"[task {task_id}] END: {state} (exit={returncode}){tag}")
+    tag = f" [{category}]" if category != "ok" else ""
+    print(f"[task {task_id}] END: {state} (exit={returncode}){tag} attempts={attempt}")
     return returncode
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="容器任务执行器(阶段 3)")
+    p = argparse.ArgumentParser(description="容器任务执行器(阶段 4)")
     p.add_argument("tasks", nargs="?", default="tasks.txt", help="任务清单文件(默认 tasks.txt)")
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                    help=f"最大并发任务数(默认 {DEFAULT_CONCURRENCY})")
@@ -234,6 +277,8 @@ def parse_args():
                    help=f"每个容器 CPU 限额(默认 {DEFAULT_CPUS})")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                    help=f"单个任务超时秒数,超时强杀容器(默认 {DEFAULT_TIMEOUT})")
+    p.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES,
+                   help=f"可重试失败的最大重试次数(默认 {DEFAULT_MAX_RETRIES})")
     p.add_argument("--resume", action="store_true",
                    help="只恢复未完成任务,不导入新清单")
     return p.parse_args()
@@ -275,9 +320,11 @@ def main():
     rows = conn.execute(
         "SELECT id, command FROM tasks WHERE state='queued' ORDER BY id"
     ).fetchall()
-    limits = {"memory": args.memory, "cpus": args.cpus, "timeout": args.timeout}
+    limits = {"memory": args.memory, "cpus": args.cpus,
+              "timeout": args.timeout, "max_retries": args.max_retries}
     print(f"\n待执行 {len(rows)} 条任务,并发={args.concurrency},"
-          f"限额 memory={args.memory} cpus={args.cpus} timeout={args.timeout}s\n")
+          f"限额 memory={args.memory} cpus={args.cpus} timeout={args.timeout}s "
+          f"max_retries={args.max_retries}\n")
 
     # ThreadPoolExecutor 的 max_workers 就是真正的并发上限:
     # 池里最多 N 个线程,即最多 N 个 docker run 同时在飞。
