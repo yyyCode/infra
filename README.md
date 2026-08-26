@@ -1,22 +1,34 @@
-# 容器任务执行器 · Infra 实操题
+# Infra 实习生笔试题 · 提交说明(叶其志)
 
 在独立 Docker 容器里批量执行任务的执行器,支持并发控制、资源限额、超时强杀、
-崩溃恢复、失败重试、日志留存和资源清理。已按 [`PLAN.md`](PLAN.md) 的 6 个阶段
-从「仅跑通最顺利情况」的初版改造到生产可用的最低标准。
+崩溃恢复、失败重试、日志留存和资源清理。已按 6 个阶段从「仅跑通最顺利情况」的
+初版改造到生产可用的最低标准。
 
-## 文件
+## 仓库链接
 
-- `runner.py` — 任务执行器。读任务清单,在独立容器里并发执行,状态落 SQLite。
-- `tasks.txt` — 测试任务:顺利任务 + 超时/吃内存/多子进程/故意失败的麻烦任务。
-- `accept.sh` — 6 项验收检查。
-- `PLAN.md` — 分阶段改造计划书。
-- `tests/` — 不依赖 docker 的自动化测试(分类/重试/查询/清理)。
+- GitHub: https://github.com/yyyCode/infra (保留完整 git log,含各阶段 PR)
+- 完整代码在本包 `runner/` 目录;走查说明见同级 `走查说明_叶其志.md`。
+
+## 提交物结构
+
+```text
+Infra实习生笔试题-叶其志-提交/
+├── runner/                 # 完整 git 仓库(保留 git log)
+│   ├── runner.py           # 任务执行器
+│   ├── tasks.txt           # 测试任务清单
+│   ├── accept.sh           # 6 项验收检查
+│   ├── PLAN.md             # 分阶段改造计划书
+│   └── tests/              # 不依赖 docker 的自动化测试
+├── 走查说明_叶其志.md       # 改了什么 / 每个坑怎么定位 / 已知未修复项
+└── README.md               # 本文件
+```
 
 ## 运行
 
 需要本机 Docker 在运行,Python 3.10+(仅标准库)。首次会拉取 `python:3.11-slim` 镜像。
 
 ```bash
+cd runner
 python3 runner.py tasks.txt --concurrency 2 --timeout 10
 ```
 
