@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Task executor — 阶段 2(超时强杀)。
+Task executor — 阶段 3(状态持久化与崩溃恢复)。
 
-在阶段 1(并发 + 资源限额 + OOM 识别)之上,新增:
-  - 每个任务带超时 --timeout;超时后真正杀掉整个容器
-  - 杀法:docker stop(给宽限 SIGTERM)-> docker kill(兜底 SIGKILL)。
-    容器是独立 PID namespace,杀容器即杀掉任务派生的整棵子进程树,不留僵尸
-  - 超时任务状态记为 timed_out
+在阶段 2(超时强杀)之上,新增:
+  - 崩溃恢复:runner 被 kill -9 后重启,上次残留在 running 的任务(崩溃时在飞)
+    会被重新入队执行;导入清单时按命令去重,不重复导入
+  - 已成功绝不重跑:只执行 state='queued' 的任务,succeeded/failed/timed_out
+    都不会再动(靠 DB 里的终态判断,天然幂等)
+  - 启动清理:清掉上一轮遗留的 runner-* 容器,避免重名冲突
 
-关键认知:subprocess 的 timeout 只会杀本地的 `docker run` 客户端进程,
-容器仍在后台跑。所以必须显式对容器 stop/kill。
+关键认知:状态即时落库(queued->running->终态),所以任何时刻被 kill -9,
+DB 都反映真实进度;重启时"running"就代表"上次没跑完",据此恢复。
 
 仍【刻意保留】的缺陷(留给后续阶段):
-  - 无崩溃恢复(不会把残留 running 重入队) (阶段 3)
   - 无失败分类与重试                    (阶段 4)
   - 无机制化资源清理(退出容器/悬空镜像)  (阶段 6)
 
 Usage:
     python3 runner.py [tasks_file] [--concurrency N] [--memory M] [--cpus C] [--timeout S]
+    python3 runner.py --resume        # 只恢复未完成任务,不导入新清单
 """
 
 import argparse
@@ -89,15 +90,42 @@ def read_tasks(path):
 
 
 def enqueue_tasks(conn, tasks):
-    """读清单 -> 入库为 queued。表已有任务则跳过(简单幂等,避免重跑重复导入)。"""
-    existing = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-    if existing:
-        print(f"DB 已有 {existing} 条任务,跳过导入")
+    """读清单 -> 入库为 queued。按命令去重:已在库里的命令不重复导入。
+
+    去重让「重跑同一份清单」是安全的——已 succeeded 的任务不会因再次导入而
+    被重置回 queued 重跑。新增的命令行会作为新任务入队。
+    """
+    existing = {row[0] for row in conn.execute("SELECT command FROM tasks")}
+    added = 0
+    with _db_lock:
+        for command in tasks:
+            if command in existing:
+                continue
+            conn.execute("INSERT INTO tasks (command, state) VALUES (?, 'queued')", (command,))
+            existing.add(command)   # 同一清单内重复行也只入一次
+            added += 1
+        conn.commit()
+    skipped = len(tasks) - added
+    print(f"已入库 {added} 条新任务(state=queued),跳过 {skipped} 条已存在")
+
+
+def recover_interrupted(conn):
+    """崩溃恢复:把上次残留在 running 的任务重新入队。
+
+    runner 正常结束时不会留下 running(每个任务都会落终态)。若重启后仍见到
+    running,说明上次是被 kill -9 之类打断、任务没跑完 —— 将其重置为 queued
+    以便本轮重新执行。已 succeeded/failed/timed_out 的一律不动。
+    """
+    rows = conn.execute("SELECT id FROM tasks WHERE state='running'").fetchall()
+    if not rows:
         return
-    for command in tasks:
-        conn.execute("INSERT INTO tasks (command, state) VALUES (?, 'queued')", (command,))
-    conn.commit()
-    print(f"已入库 {len(tasks)} 条任务(state=queued)")
+    ids = [r[0] for r in rows]
+    with _db_lock:
+        conn.execute(
+            "UPDATE tasks SET state='queued' WHERE state='running'"
+        )
+        conn.commit()
+    print(f"检测到 {len(ids)} 个未完成任务(上次崩溃残留),已重置为 queued: {ids}")
 
 
 def was_oom_killed(name):
@@ -196,7 +224,7 @@ def run_task(conn, task_id, command, limits, log_dir=LOG_DIR):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="容器任务执行器(阶段 2)")
+    p = argparse.ArgumentParser(description="容器任务执行器(阶段 3)")
     p.add_argument("tasks", nargs="?", default="tasks.txt", help="任务清单文件(默认 tasks.txt)")
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                    help=f"最大并发任务数(默认 {DEFAULT_CONCURRENCY})")
@@ -206,7 +234,22 @@ def parse_args():
                    help=f"每个容器 CPU 限额(默认 {DEFAULT_CPUS})")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                    help=f"单个任务超时秒数,超时强杀容器(默认 {DEFAULT_TIMEOUT})")
+    p.add_argument("--resume", action="store_true",
+                   help="只恢复未完成任务,不导入新清单")
     return p.parse_args()
+
+
+def cleanup_stale_containers():
+    """启动时清掉上一轮遗留的 runner-* 容器,避免重名冲突。"""
+    r = subprocess.run(
+        ["docker", "ps", "-aq", "--filter", "name=^runner-"],
+        capture_output=True, text=True,
+    )
+    ids = r.stdout.split()
+    if ids:
+        subprocess.run(["docker", "rm", "-f", *ids],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"启动清理:移除 {len(ids)} 个遗留 runner-* 容器")
 
 
 def main():
@@ -214,10 +257,19 @@ def main():
     os.makedirs(LOG_DIR, exist_ok=True)
     conn = init_db()
 
-    # 第一步:读清单入库
-    tasks = read_tasks(args.tasks)
-    print(f"从 {args.tasks} 读到 {len(tasks)} 条任务")
-    enqueue_tasks(conn, tasks)
+    # 启动清理:去掉上一轮残留容器(重名会导致 docker run 失败)
+    cleanup_stale_containers()
+
+    # 崩溃恢复:把上次残留 running 的任务重置为 queued 以便重跑
+    recover_interrupted(conn)
+
+    # 第一步:读清单入库(--resume 时跳过,只跑恢复出来的未完成任务)
+    if args.resume:
+        print("--resume:跳过清单导入,只执行未完成任务")
+    else:
+        tasks = read_tasks(args.tasks)
+        print(f"从 {args.tasks} 读到 {len(tasks)} 条任务")
+        enqueue_tasks(conn, tasks)
 
     # 第二步:取所有 queued(已 succeeded 的不是 queued,天然不重跑),并发执行。
     rows = conn.execute(
